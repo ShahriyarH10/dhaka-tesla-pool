@@ -32,7 +32,7 @@ async function poolInfoFor(db, requestIds) {
   if (requestIds.length === 0) return new Map();
   const { rows } = await db.query(
     `SELECT DISTINCT ON (m.request_id)
-            m.request_id, p.id AS pool_id, p.status AS pool_status, t.name AS tesla_name, t.plate, u.name AS driver_name,
+            m.request_id, p.id AS pool_id, p.status AS pool_status, p.capacity AS pool_capacity, t.name AS tesla_name, t.plate, u.name AS driver_name,
             (SELECT count(*) FROM pool_members m2
               WHERE m2.pool_id = p.id AND m2.request_id <> m.request_id
                 AND (m2.left_at IS NULL OR m2.left_reason = 'COMPLETED')) AS co_passengers
@@ -47,7 +47,7 @@ async function poolInfoFor(db, requestIds) {
   return new Map(
     rows.map((r) => [
       r.request_id,
-      { id: r.pool_id, status: r.pool_status, teslaName: r.tesla_name, plate: r.plate, driverName: r.driver_name, coPassengers: r.co_passengers },
+      { id: r.pool_id, status: r.pool_status, capacity: r.pool_capacity, teslaName: r.tesla_name, plate: r.plate, driverName: r.driver_name, coPassengers: r.co_passengers },
     ]),
   );
 }
