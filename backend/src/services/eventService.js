@@ -8,9 +8,13 @@ export async function recordEvent(db, { entityType, entityId, from = null, to, a
   );
 }
 
-export async function listEvents(db, entityType, entityId) {
+/**
+ * @param viewerId  when set, names of OTHER passengers are hidden (a passenger must never learn who else was in the pool);
+ *                  the driver's and the viewer's own names stay visible.
+ */
+export async function listEvents(db, entityType, entityId, { viewerId = null } = {}) {
   const { rows } = await db.query(
-    `SELECT e.from_status, e.to_status, e.metadata, e.created_at, u.name AS actor_name, u.role AS actor_role
+    `SELECT e.from_status, e.to_status, e.metadata, e.created_at, e.actor_user_id, u.name AS actor_name, u.role AS actor_role
        FROM ride_events e LEFT JOIN users u ON u.id = e.actor_user_id
       WHERE e.entity_type = $1 AND e.entity_id = $2 ORDER BY e.id`,
     [entityType, entityId],
@@ -19,7 +23,11 @@ export async function listEvents(db, entityType, entityId) {
     from: r.from_status,
     to: r.to_status,
     at: r.created_at,
-    actor: r.actor_name ? { name: r.actor_name, role: r.actor_role } : null,
+    actor: !r.actor_name
+      ? null
+      : viewerId && r.actor_role === 'PASSENGER' && r.actor_user_id !== viewerId
+        ? { role: 'PASSENGER' }
+        : { name: r.actor_name, role: r.actor_role },
     metadata: r.metadata,
   }));
 }

@@ -1,12 +1,13 @@
 import { pool, withTransaction } from '../db/pool.js';
 import { estimateFare } from '../domain/fare.js';
-import { assertTransition } from '../domain/stateMachine.js';
-import { conflict, notFound } from '../utils/errors.js';
+import { POOL_OPEN, assertTransition } from '../domain/stateMachine.js';
+import { AppError, conflict, notFound } from '../utils/errors.js';
 import { listEvents, recordEvent } from './eventService.js';
+import { lockPool, recomputeFares, removeMember, tryJoinPool } from './poolService.js';
 
 const ACTIVE_RIDE_INDEX = 'ride_requests_one_active_per_passenger';
 
-/** Shape returned to a passenger: ONLY their own fare and status. */
+/** Shape returned to a passenger: ONLY their own fare and status. Co-passengers appear as a count, never by name/fare. */
 export function toPassengerView(r, extra = {}) {
   return {
     id: r.id,
@@ -18,10 +19,60 @@ export function toPassengerView(r, extra = {}) {
     farePaisa: r.fare_paisa,
     fareBreakdown: r.fare_breakdown,
     fareLocked: r.fare_locked,
+    estimatedPooledFarePaisa: estimateFare({ pickup: r.pickup_zone, destination: r.destination_zone, seats: r.seats }).pooledTotal,
     createdAt: r.created_at,
     updatedAt: r.updated_at,
+    pool: null,
     ...extra,
   };
+}
+
+/** Current/final pool info for a batch of requests (one query, no N+1). */
+async function poolInfoFor(db, requestIds) {
+  if (requestIds.length === 0) return new Map();
+  const { rows } = await db.query(
+    `SELECT DISTINCT ON (m.request_id)
+            m.request_id, p.id AS pool_id, p.status AS pool_status, t.name AS tesla_name, t.plate, u.name AS driver_name,
+            (SELECT count(*) FROM pool_members m2
+              WHERE m2.pool_id = p.id AND m2.request_id <> m.request_id
+                AND (m2.left_at IS NULL OR m2.left_reason = 'COMPLETED')) AS co_passengers
+       FROM pool_members m
+       JOIN pools p ON p.id = m.pool_id
+       JOIN teslas t ON t.id = p.tesla_id
+       JOIN users u ON u.id = t.driver_id
+      WHERE m.request_id = ANY($1) AND (m.left_at IS NULL OR m.left_reason = 'COMPLETED')
+      ORDER BY m.request_id, m.joined_at DESC`,
+    [requestIds],
+  );
+  return new Map(
+    rows.map((r) => [
+      r.request_id,
+      { id: r.pool_id, status: r.pool_status, teslaName: r.tesla_name, plate: r.plate, driverName: r.driver_name, coPassengers: r.co_passengers },
+    ]),
+  );
+}
+
+async function viewById(db, requestId, withEvents = false, viewerId = null) {
+  const { rows } = await db.query('SELECT * FROM ride_requests WHERE id = $1', [requestId]);
+  const info = await poolInfoFor(db, [requestId]);
+  const extra = { pool: info.get(requestId) ?? null };
+  if (withEvents) extra.events = await listEvents(db, 'REQUEST', requestId, { viewerId });
+  return toPassengerView(rows[0], extra);
+}
+
+/** Try open pools in a fixed global order (created_at, id) so concurrent matchers lock pools in the same order. */
+async function autoMatch(db, request, actorId) {
+  const { rows } = await db.query(
+    `SELECT id FROM pools
+      WHERE status = ANY($1) AND pickup_zone = $2 AND seats_taken + $3 <= capacity
+      ORDER BY created_at, id`,
+    [POOL_OPEN, request.pickup_zone, request.seats],
+  );
+  for (const candidate of rows) {
+    const res = await tryJoinPool(db, { poolId: candidate.id, requestId: request.id, actorId, source: 'AUTO_MATCH' });
+    if (res.ok) return res;
+  }
+  return null;
 }
 
 export async function createRideRequest(passengerId, { pickup, destination, seats, paymentMethod }) {
@@ -48,7 +99,8 @@ export async function createRideRequest(passengerId, { pickup, destination, seat
       );
       const request = rows[0];
       await recordEvent(db, { entityType: 'REQUEST', entityId: request.id, to: 'REQUESTED', actorId: passengerId });
-      return toPassengerView(request);
+      await autoMatch(db, request, passengerId); // "in about a second": join a compatible open Tesla if there is one
+      return viewById(db, request.id);
     });
   } catch (err) {
     if (err.code === '23505' && err.constraint === ACTIVE_RIDE_INDEX) {
@@ -63,36 +115,56 @@ export async function listRides(passengerId, { limit, offset }) {
     `SELECT * FROM ride_requests WHERE passenger_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
     [passengerId, limit, offset],
   );
-  return rows.map((r) => toPassengerView(r));
+  const info = await poolInfoFor(pool, rows.map((r) => r.id));
+  return rows.map((r) => toPassengerView(r, { pool: info.get(r.id) ?? null }));
 }
 
 export async function getRide(passengerId, requestId) {
-  const { rows } = await pool.query('SELECT * FROM ride_requests WHERE id = $1 AND passenger_id = $2', [
+  const { rows } = await pool.query('SELECT id FROM ride_requests WHERE id = $1 AND passenger_id = $2', [
     requestId,
     passengerId,
   ]);
   // 404 (not 403) for someone else's ride: do not confirm that the id exists.
   if (!rows[0]) throw notFound('Ride not found');
-  return toPassengerView(rows[0], { events: await listEvents(pool, 'REQUEST', requestId) });
+  return viewById(pool, requestId, true, passengerId);
+}
+
+const RETRY = Symbol('retry');
+
+async function cancelOnce(db, passengerId, requestId) {
+  // Lock order: pool first, then request. We do not know the pool until we peek at the membership.
+  const peek = await db.query('SELECT id, passenger_id FROM ride_requests WHERE id = $1', [requestId]);
+  if (!peek.rows[0] || peek.rows[0].passenger_id !== passengerId) throw notFound('Ride not found');
+
+  const m0 = (await db.query('SELECT pool_id FROM pool_members WHERE request_id = $1 AND left_at IS NULL', [requestId])).rows[0];
+  if (m0) await lockPool(db, m0.pool_id);
+
+  const r = (await db.query('SELECT * FROM ride_requests WHERE id = $1 FOR UPDATE', [requestId])).rows[0];
+  const m = (await db.query('SELECT pool_id FROM pool_members WHERE request_id = $1 AND left_at IS NULL', [requestId])).rows[0];
+  if ((m?.pool_id ?? null) !== (m0?.pool_id ?? null)) throw RETRY; // membership changed between peek and lock
+
+  assertTransition('REQUEST', r.status, 'CANCELLED'); // only REQUESTED or MATCHED are cancellable
+
+  if (m) await removeMember(db, { poolId: m.pool_id, requestId, reason: 'PASSENGER_CANCELLED' });
+  await db.query(
+    `UPDATE ride_requests SET status = 'CANCELLED', cancelled_reason = 'PASSENGER_CANCELLED', updated_at = now() WHERE id = $1`,
+    [requestId],
+  );
+  await recordEvent(db, {
+    entityType: 'REQUEST', entityId: requestId, from: r.status, to: 'CANCELLED', actorId: passengerId,
+    metadata: m ? { poolId: m.pool_id, seatsReleased: r.seats } : {},
+  });
+  if (m) await recomputeFares(db, m.pool_id, passengerId); // remaining passenger loses the pool discount if alone
+  return viewById(db, requestId);
 }
 
 export async function cancelRide(passengerId, requestId) {
-  return withTransaction(async (db) => {
-    const { rows } = await db.query('SELECT * FROM ride_requests WHERE id = $1 AND passenger_id = $2 FOR UPDATE', [
-      requestId,
-      passengerId,
-    ]);
-    const r = rows[0];
-    if (!r) throw notFound('Ride not found');
-    assertTransition('REQUEST', r.status, 'CANCELLED');
-    const upd = await db.query(
-      `UPDATE ride_requests SET status = 'CANCELLED', cancelled_reason = 'PASSENGER_CANCELLED', updated_at = now()
-        WHERE id = $1 RETURNING *`,
-      [requestId],
-    );
-    await recordEvent(db, {
-      entityType: 'REQUEST', entityId: requestId, from: r.status, to: 'CANCELLED', actorId: passengerId,
-    });
-    return toPassengerView(upd.rows[0]);
-  });
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await withTransaction((db) => cancelOnce(db, passengerId, requestId));
+    } catch (err) {
+      if (err !== RETRY) throw err;
+    }
+  }
+  throw new AppError(409, 'CONCURRENT_UPDATE', 'Your ride changed while cancelling. Please try again.');
 }

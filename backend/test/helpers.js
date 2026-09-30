@@ -63,3 +63,21 @@ export async function makeDriver(name = 'Jashim', tesla = { name: 'Bullet', plat
 
 export const requestRide = (p, body) =>
   api('POST', '/api/rides', { token: p.token, body: { seats: 1, paymentMethod: 'CASH', ...body } });
+
+export const goOnline = (d, online = true) => api('PATCH', '/api/driver/availability', { token: d.token, body: { online } });
+export const accept = (d, rideId) => api('POST', `/api/driver/requests/${rideId}/accept`, { token: d.token });
+export const getRide = (p, id) => api('GET', `/api/rides/${id}`, { token: p.token });
+
+/** The pooling invariants that must hold after ANY sequence of operations. */
+export async function assertPoolInvariants() {
+  const { rows } = await pool.query(`
+    SELECT p.id, p.capacity, p.seats_taken, p.status,
+           COALESCE((SELECT sum(seats) FROM pool_members m WHERE m.pool_id = p.id AND m.left_at IS NULL), 0)::int AS active_seats
+      FROM pools p`);
+  for (const r of rows) {
+    if (r.seats_taken > r.capacity) throw new Error(`pool ${r.id} overbooked: ${r.seats_taken}/${r.capacity}`);
+    if (['ACCEPTED', 'DRIVER_ARRIVED', 'STARTED'].includes(r.status) && r.seats_taken !== r.active_seats) {
+      throw new Error(`pool ${r.id} counter drift: seats_taken=${r.seats_taken} but active member seats=${r.active_seats}`);
+    }
+  }
+}
