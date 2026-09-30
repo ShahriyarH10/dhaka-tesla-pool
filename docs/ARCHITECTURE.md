@@ -81,15 +81,22 @@ Hand check: Nusrat 4000 + 2.0*1500 = 7000 -> pooled 5600. Rafiq 4000 + 3.0*1500 
 
 Problem: Bullet has 1 seat left, Nusrat and Shirin both claim it at the same instant.
 
-* Seat claim is a **single conditional UPDATE**:
-  `UPDATE pools SET seats_taken = seats_taken + $n WHERE id = $1 AND status IN (...) AND seats_taken + $n <= capacity RETURNING ...`
-  Postgres takes a row lock, so concurrent claims serialize; the loser re-evaluates the predicate against the
-  winner's committed value, matches zero rows, and gets a 409.
-* Defense in depth: `CHECK (seats_taken <= capacity)` on `pools` - even a buggy code path cannot overbook.
-* Request claim: `UPDATE ride_requests SET status='MATCHED' WHERE id=$1 AND status='REQUESTED'` so two drivers
-  cannot accept the same request.
-* Lock order is always request -> pool, so no deadlock cycle.
-* Everything is in one transaction; a failed seat claim rolls the request claim back.
+Three layers, each sufficient on its own to stop overbooking:
+
+1. **Pool row lock.** Every join, leave and lifecycle transition starts with `SELECT ... FROM pools WHERE id = $1 FOR UPDATE`.
+   Nusrat's and Shirin's transactions therefore queue on the same pool row; the second one only runs after the
+   first has committed, re-reads `seats_taken`, and is rejected by the compatibility check (409).
+2. **Conditional UPDATE.** The seat claim is
+   `UPDATE pools SET seats_taken = seats_taken + $n WHERE id = $1 AND status IN (...) AND seats_taken + $n <= capacity RETURNING ...`
+   and matching zero rows means "no seats". Redundant while the lock is held, kept so the claim stays correct
+   if someone later removes or narrows the lock.
+3. **`CHECK (seats_taken <= capacity)`** on `pools`: even a buggy code path cannot commit an overbooked pool.
+
+Request claim: `UPDATE ride_requests SET status='MATCHED' WHERE id=$1 AND status='REQUESTED'` so two drivers
+(or an accept racing a passenger cancel) cannot both win the same request.
+
+Lock order is always **pool row -> request rows (ordered by id)**, never the reverse, so a join and a cancel
+cannot form a deadlock cycle. Everything runs in one transaction; a failed claim rolls back as a unit.
 
 At larger scale: see the "If Oi Tesla Goes Viral" section of the README.
 
