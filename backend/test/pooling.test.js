@@ -37,6 +37,7 @@ test('Nusrat + Rafiq share Bullet: individual pooled fares 5600 and 6800 paisa',
   assert.equal(nAfter.farePaisa, 5600);
   assert.equal(nAfter.fareBreakdown.poolDiscount, 1400);
   assert.equal(nAfter.pool.coPassengers, 1);
+  assert.equal(nAfter.pool.capacity, 3, 'passenger UI needs the seat count to draw the strip');
   assert.doesNotMatch(JSON.stringify(nAfter), /Rafiq|6800/, "Nusrat must not see Rafiq's name or fare");
   assert.ok(nAfter.events.some((e) => e.metadata.type === 'FARE_RECALCULATED'), 'fare change is auditable');
 
