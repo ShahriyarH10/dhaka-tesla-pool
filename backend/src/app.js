@@ -9,6 +9,7 @@ import { healthRouter } from './routes/health.js';
 import { authRouter } from './routes/auth.js';
 import { metaRouter } from './routes/meta.js';
 import { ridesRouter } from './routes/rides.js';
+import { driverRouter } from './routes/driver.js';
 
 export function createApp() {
   const app = express();
@@ -22,6 +23,7 @@ export function createApp() {
   app.use('/api/auth', authRouter);
   app.use('/api', metaRouter);
   app.use('/api/rides', ridesRouter);
+  app.use('/api/driver', driverRouter);
 
   app.use(notFoundHandler);
   app.use(errorHandler);
