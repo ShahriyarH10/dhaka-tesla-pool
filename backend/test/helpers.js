@@ -44,3 +44,22 @@ export async function api(method, path, { token, body } = {}) {
   const text = await res.text();
   return { status: res.status, body: text ? JSON.parse(text) : null };
 }
+
+// ---- story cast factories (Jashim/Bullet, Nusrat, Rafiq, Shirin) ----
+let counter = 0;
+export async function makePassenger(name) {
+  const res = await api('POST', '/api/auth/register', {
+    body: { role: 'PASSENGER', name, email: `${name.toLowerCase()}${++counter}@example.com`, password: 'dhaka-rush-hour-9' },
+  });
+  return { token: res.body.token, id: res.body.user.id, name };
+}
+
+export async function makeDriver(name = 'Jashim', tesla = { name: 'Bullet', plate: `DHAKA-TESLA-${++counter}`, capacity: 3 }) {
+  const res = await api('POST', '/api/auth/register', {
+    body: { role: 'DRIVER', name, email: `${name.toLowerCase()}${++counter}@example.com`, password: 'dhaka-rush-hour-9', tesla },
+  });
+  return { token: res.body.token, id: res.body.user.id, name, tesla: res.body.tesla };
+}
+
+export const requestRide = (p, body) =>
+  api('POST', '/api/rides', { token: p.token, body: { seats: 1, paymentMethod: 'CASH', ...body } });
