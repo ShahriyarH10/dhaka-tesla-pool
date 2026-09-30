@@ -171,3 +171,21 @@ export async function acceptRequest(driverId, requestId) {
     throw err;
   }
 }
+
+/** Ride history for the driver's Tesla, newest first. */
+export async function listPools(driverId, { limit, offset }) {
+  const tesla = await getTesla(pool, driverId);
+  const { rows } = await pool.query(
+    'SELECT id FROM pools WHERE tesla_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3',
+    [tesla.id, limit, offset],
+  );
+  return Promise.all(rows.map((r) => getPoolView(pool, r.id)));
+}
+
+/** One of the driver's own pools with the full audit trail ("explain exactly what happened"). */
+export async function getOwnPool(driverId, poolId) {
+  const tesla = await getTesla(pool, driverId);
+  const { rows } = await pool.query('SELECT id FROM pools WHERE id = $1 AND tesla_id = $2', [poolId, tesla.id]);
+  if (!rows[0]) throw notFound('Pool not found');
+  return getPoolView(pool, poolId, { withEvents: true });
+}
