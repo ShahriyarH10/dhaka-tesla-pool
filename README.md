@@ -333,7 +333,7 @@ Two more races: a request can only move `REQUESTED -> MATCHED` once (`UPDATE ...
 so two drivers accepting the same request, or an accept racing a passenger cancel, produce exactly one
 winner. Lock order is always **pool -> requests ordered by id**, which removes deadlock cycles.
 
-Tested in `backend/test/pooling.test.js`: last-seat race, 12-way race for 3 seats, double accept, two
+Tested in `backend/test/pooling.test.js`: last-seat race, 12 passengers racing for 1 remaining seat, double accept, two
 drivers on one request, cancel vs accept. The 50-test suite was run repeatedly, with no flakes and no deadlocks logged.
 
 **At larger scale** I would keep Postgres as the source of truth and change *where* contention lives: shard
@@ -395,7 +395,7 @@ are hidden in event timelines. Drivers see only their own pools.
 - Polling, not push; up to 4 s of staleness.
 - No cancellation fees, ratings, refunds, or driver payouts. TeslaPay is a wallet balance, not a gateway.
 - No refresh tokens or token revocation; logout is client-side only.
-- Rate limiting is in-process, so it is per API instance.
+- Rate limiting covers the auth endpoints only, and is in-process (per API instance). Ride endpoints are not rate limited.
 - No migration rollback. No end-to-end browser tests.
 - The Docker setup could not be run in the environment where this code was written (no Docker daemon). The
   Dockerfiles and compose file follow standard patterns but **were not executed there**; see the checklist
@@ -423,7 +423,7 @@ shapes most of what follows, and it does not exist in this MVP at all (there is 
 | Ride matching, DB contention | Shard matching by zone/cell: one worker owns a cell's pools, so the last-seat lock is uncontended in practice; Postgres row lock stays as the correctness backstop | Hot pools are the contention; partitioning spreads it |
 | Queues / events | Publish transition events (from `ride_events`, via outbox) to a queue for notifications, payments, analytics | Moves slow side-effects off the request path without a dual-write bug |
 | Real-time | SSE (or WebSockets) replaces polling; fan-out via Redis pub/sub | Polling 1M users at 4 s is 250k req/s of mostly "no change" |
-| Rate limiting | Move from in-process to a shared store at the edge / gateway, per user and per IP | Current limiter is per instance |
+| Rate limiting | Move to a shared store at the edge / gateway, per user and per IP, covering all write endpoints | Today only auth is limited, per instance |
 | Idempotency | `Idempotency-Key` on `POST /rides` and accept; unique key table | Mobile retries on bad networks must not double-book |
 | Retries, failures | Timeouts, bounded retries with jitter, circuit breaker on payments; matching is at-least-once, safe because claims are conditional | Retries are safe only where operations are idempotent |
 | Security | Short-lived access tokens + refresh, revocation list, secrets manager, WAF, per-role audit | Current JWT has no revocation |
